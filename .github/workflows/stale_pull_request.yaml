@@ -1,10 +1,9 @@
+
 name: Mark and Close Stale Pull Requests
 
 on:
-  schedule:
-    # Runs twice a day at 15 minutes past midnight and noon UTC
-    - cron: '15 */12 * * *'
-
+  workflow_dispatch:
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 jobs:
   stale:
     runs-on: ubuntu-latest
