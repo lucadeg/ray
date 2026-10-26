@@ -16,6 +16,7 @@ from ray.autoscaler._private.constants import (
     DEFAULT_UPSCALING_SPEED,
     DISABLE_LAUNCH_CONFIG_CHECK_KEY,
     DISABLE_NODE_UPDATERS_KEY,
+    RAY_AUTOSCALER_PENDING_NODE_IDLE_TIMEOUT_S,
 )
 from ray.autoscaler._private.kuberay.autoscaling_config import AutoscalingConfigProducer
 from ray.autoscaler._private.monitor import BASE_READONLY_CONFIG
@@ -111,6 +112,17 @@ class InstanceReconcileConfig:
     max_num_retry_request_to_allocate: int = env_integer(
         "RAY_AUTOSCALER_RECONCILE_MAX_NUM_RETRY_REQUEST_TO_ALLOCATE", 3
     )
+    # How long to retain a TERMINATED instance record before garbage collecting
+    # it from the instance storage. TERMINATED is a terminal state and nothing
+    # else removes these records, so without GC the storage—and the per-cycle
+    # reconcile cost and serialized AutoscalingState that scan it—grow without
+    # bound on instance-churning clusters. The default retains a full day of
+    # terminations so the status_history of recently reclaimed nodes stays
+    # inspectable for post-incident triage (e.g. overnight scaling issues),
+    # while bounding steady-state memory to roughly one day of churn.
+    terminated_instance_gc_retention_s: int = env_integer(
+        "RAY_AUTOSCALER_RECONCILE_TERMINATED_INSTANCE_GC_RETENTION_S", 24 * 60 * 60
+    )
 
 
 @dataclass
@@ -129,6 +141,8 @@ class NodeTypeConfig:
     max_worker_nodes: int
     # Idle timeout seconds for worker nodes of this node type.
     idle_timeout_s: Optional[float] = None
+    # The priority of the worker group. Higher value means the group will be scaled up first if everything else is equal.
+    priority: int = 0
     # The total resources on the node.
     resources: Dict[str, float] = field(default_factory=dict)
     # The labels on the node.
@@ -160,11 +174,12 @@ class AutoscalingConfig:
         configs: Dict[str, Any],
         skip_content_hash: bool = False,
     ) -> None:
-        """
+        """Initialize the autoscaling config.
+
         Args:
-            configs : The raw configs dict.
-            skip_content_hash :
-                Whether to skip file mounts/ray command hash calculation.
+            configs: The raw configs dict.
+            skip_content_hash: Whether to skip file mounts/ray command hash
+                calculation.
         """
         self._sync_continuously = False
         self.update_configs(configs, skip_content_hash)
@@ -350,6 +365,7 @@ class AutoscalingConfig:
                 min_worker_nodes=node_config.get("min_workers", 0),
                 max_worker_nodes=max_workers_nodes,
                 idle_timeout_s=node_config.get("idle_timeout_s", None),
+                priority=node_config.get("priority", 0),
                 resources=node_config.get("resources", {}),
                 labels=node_config.get("labels", {}),
                 launch_config_hash=launch_config_hash,
@@ -398,6 +414,14 @@ class AutoscalingConfig:
         """
         idle_timeout_s = self.get_config("idle_timeout_minutes", None)
         return idle_timeout_s * 60 if idle_timeout_s is not None else None
+
+    def get_pending_idle_timeout_s(self) -> Optional[float]:
+        """
+        Returns the idle timeout in seconds for the pending nodes not needed by any
+        resource demands, or None if they should never be terminated for it.
+        """
+        timeout_s = RAY_AUTOSCALER_PENDING_NODE_IDLE_TIMEOUT_S
+        return float(timeout_s) if timeout_s >= 0 else None
 
     def disable_launch_config_check(self) -> bool:
         provider_config = self.get_provider_config()
@@ -452,10 +476,11 @@ class FileConfigReader(IConfigReader):
     """A class that reads cluster config from a yaml file."""
 
     def __init__(self, config_file: str, skip_content_hash: bool = True) -> None:
-        """
+        """Initialize the file config reader.
+
         Args:
             config_file: The path to the config file.
-            skip_content_hash:  Whether to skip file mounts/ray command
+            skip_content_hash: Whether to skip file mounts/ray command
                 hash calculation. Default to True.
         """
         self._config_file_path = Path(config_file).resolve()

@@ -40,13 +40,6 @@ steps:
       PYTHON: "3.10"
     tags: cibase
 
-  - name: datatfxbslbuild-multipy
-    label: "wanda: datatfxbslbuild-py3.11"
-    wanda: ci/docker/datatfxbsl.build.wanda.yaml
-    env:
-      PYTHON: "3.11"
-    tags: cibase
-
   - name: datatfdsbuild-multipy
     label: "wanda: datatfdsbuild-py3.12"
     wanda: ci/docker/datatfds.build.wanda.yaml
@@ -60,7 +53,9 @@ steps:
     env:
       PYTHON: "3.12"
     depends_on: oss-ci-base_gpu-multipy(python=3.12)
-    tags: cibase
+    tags:
+      - oss
+      - cibase
 
   # type check
   - label: ":python: pyrefly type check"
@@ -74,6 +69,7 @@ steps:
 
   # tests
   - label: ":database: data: arrow v17 tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
     instance_type: large
@@ -87,9 +83,9 @@ steps:
     depends_on: data17build-multipy(python=3.10)
 
   - label: ":database: data: tensorflow-datasets tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     key: data_tensorflow_datasets_tests
     tags:
-      - python
       - data
     instance_type: medium
     commands:
@@ -99,6 +95,7 @@ steps:
     depends_on: datatfdsbuild-multipy
 
   - label: ":database: data: arrow v17 tests (data_non_parallel)"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
       - data_non_parallel
@@ -115,8 +112,8 @@ steps:
 
   - label: ":database: data: arrow v23 tests"
     tags:
-      - python
       - data
+      - skip-on-premerge
     instance_type: medium
     parallelism: 8
     commands:
@@ -129,9 +126,9 @@ steps:
 
   - label: ":database: data: arrow v23 tests (data_non_parallel)"
     tags:
-      - python
       - data
       - data_non_parallel
+      - skip-on-premerge
     instance_type: medium
     parallelism: 3
     commands:
@@ -229,6 +226,7 @@ steps:
     depends_on: datalbuild-multipy(python=3.10)
 
   - label: ":database: data: dask tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
       - dask
@@ -239,20 +237,11 @@ steps:
         --only-tags dask
     depends_on: datalbuild-multipy(python=3.12)
 
-  - label: ":database: data: TFRecords (tfx-bsl) tests"
+  - label: ":database: data: docs example tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
-    instance_type: medium
-    commands:
-      - bazel run //ci/ray_ci:test_in_docker -- //python/ray/data/... data
-        --build-name datatfxbslbuild-py3.11 --python-version 3.11
-        --only-tags tfxbsl
-    depends_on: datatfxbslbuild-multipy
-
-  - label: ":database: data: doc tests"
-    tags:
-      - data
-      - doc
+      - data_doc
     instance_type: medium
     commands:
       # doc tests
@@ -271,10 +260,11 @@ steps:
         --skip-ray-installation
     depends_on: datalbuild-multipy(python=3.10)
 
-  - label: ":database: data: dask doc tests"
+  - label: ":database: data: dask docs example tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
-      - doc
+      - data_doc
     instance_type: medium
     commands:
       - bazel run //ci/ray_ci:test_in_docker -- //doc/... data
@@ -284,10 +274,11 @@ steps:
         --parallelism-per-worker 2
     depends_on: datalbuild-multipy(python=3.12)
 
-  - label: ":database: data: doc gpu tests"
+  - label: ":database: data: docs example gpu tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
-      - doc
+      - data_doc
       - gpu
     instance_type: gpu-large
     commands:
@@ -307,6 +298,7 @@ steps:
     depends_on: docgpubuild
 
   - label: ":database: data: cuDF batch format tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
       - data
       - gpu
@@ -321,8 +313,8 @@ steps:
     depends_on: docgpubuild-py312
 
   - label: ":database: data: integration tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
-      - python
       - data
     instance_type: medium
     commands:
@@ -335,8 +327,8 @@ steps:
     depends_on: datamongobuild-multipy
 
   - label: ":database: data: dashboard tests"
+    if: '!(build.pull_request.labels includes "docstring-only")'
     tags:
-      - python
       - data
       - dashboard
     instance_type: small
@@ -350,7 +342,6 @@ steps:
   - label: ":database: data: flaky tests"
     key: data_flaky_tests
     tags:
-      - python
       - data
       - flaky
       - skip-on-premerge
@@ -367,7 +358,6 @@ steps:
   - label: ":database: data: flaky gpu tests"
     key: data_flaky_gpu_tests
     tags:
-      - python
       - data
       - skip-on-premerge
     instance_type: gpu-large
@@ -382,7 +372,6 @@ steps:
   - label: ":database: data: postmerge authenticated tests"
     key: data_postmerge_authenticated_tests
     tags:
-      - python
       - data
       - oss
       - skip-on-premerge

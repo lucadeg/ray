@@ -4,11 +4,10 @@ import pickle
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Set, Tuple
-
-import grpc
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
 import ray
+from ray._private.grpc_utils import init_grpc_channel
 from ray.actor import ActorHandle
 from ray.serve._private.common import (
     DeploymentID,
@@ -194,7 +193,9 @@ class RunningReplica:
         # This avoids the borrower-of-borrower pattern while minimizing GCS lookups.
         actor_handle = replica_info.get_actor_handle()
         if replica_info.is_cross_language:
-            self._actor_handle = JavaActorHandleProxy(actor_handle)
+            self._actor_handle: Union[
+                ActorHandle, JavaActorHandleProxy
+            ] = JavaActorHandleProxy(actor_handle)
         else:
             self._actor_handle = actor_handle
 
@@ -204,7 +205,7 @@ class RunningReplica:
 
         # Replica wrappers
         self._actor_replica_wrapper = ActorReplicaWrapper(self._actor_handle)
-        self._grpc_replica_wrapper = None
+        self._grpc_replica_wrapper: Optional[gRPCReplicaWrapper] = None
 
     def update_replica_info(self, replica_info: RunningReplicaInfo) -> None:
         """Update mutable fields from a new RunningReplicaInfo.
@@ -237,7 +238,9 @@ class RunningReplica:
     @property
     def node_id(self) -> str:
         """Node ID of the node this replica is running on."""
-        return self._replica_info.node_id
+        # NOTE: `RunningReplicaInfo.node_id` is `Optional[str]`, so this can
+        # actually return `None` despite the declared return type.
+        return self._replica_info.node_id  # type: ignore[return-value]
 
     @property
     def availability_zone(self) -> Optional[str]:
@@ -253,6 +256,12 @@ class RunningReplica:
     def routing_stats(self) -> Dict[str, Any]:
         """Dictionary of routing stats."""
         return self._replica_info.routing_stats
+
+    @property
+    def replica_metadata(self) -> Dict[str, Any]:
+        """Static per-replica metadata captured once when the replica became ready."""
+        # Return a copy so callers can't mutate the RunningReplicaInfo's dict.
+        return self._replica_info.replica_metadata.copy()
 
     @property
     def max_ongoing_requests(self) -> int:
@@ -276,7 +285,10 @@ class RunningReplica:
     @property
     def stub(self):
         if self._stub is None:
-            self._channel = grpc.aio.insecure_channel(
+            # Created via the shared helper so that Ray's authentication client
+            # interceptors and TLS credentials are applied; a raw insecure
+            # channel would be rejected by the replica's authenticated server.
+            self._channel = init_grpc_channel(
                 f"{self._replica_info.node_ip}:{self._replica_info.port}",
                 options=[
                     (
@@ -284,6 +296,7 @@ class RunningReplica:
                         RAY_SERVE_REPLICA_GRPC_MAX_MESSAGE_LENGTH,
                     )
                 ],
+                asynchronous=True,
             )
             self._stub = ASGIServiceStub(self._channel)
 
@@ -348,7 +361,12 @@ class RunningReplica:
             accepted, num_ongoing_requests = await obj_ref
         except asyncio.CancelledError:
             ray.cancel(obj_ref)
-            # TODO (#63254): Add error handling for actor-unavailable cleanup.
+            self._actor_handle.release_slot.remote(slot_token)
+            raise
+        except Exception:
+            # The actor may have reserved the slot before the reply was lost
+            # (e.g. ActorUnavailableError). `release_slot` is idempotent for unknown
+            # tokens, so this is safe even when the reservation never actually happened.
             self._actor_handle.release_slot.remote(slot_token)
             raise
 
@@ -398,15 +416,27 @@ class ReplicaSelection:
     availability_zone: Optional[str]
     """Cloud availability zone of the replica's node."""
 
+    replica_metadata: Dict[str, Any]
+    """Static, immutable per-replica metadata published by the deployment's
+    ``record_replica_metadata`` hook (captured once when the replica became
+    ready). Empty dict if the deployment does not define the hook."""
+
     # Internal fields (not part of public API)
     _replica: RunningReplica
     _deployment_id: Optional[DeploymentID]
     _request_metadata: RequestMetadata
     _method_name: str
-    _slot_token: str  # Token for reserved slot
+    # Token to be used for replica reservation;
+    # Can be None when created via the pick-only path
+    _slot_token: Optional[str]
     _dispatched: bool = field(
         default=False, init=False
     )  # Tracks if dispatch was called
+
+    # Set by dispatch once the result's done-callback is wired up. Read by
+    # choose_replica's finally to decide whether to fire on_request_completed
+    # manually (only one of the two paths should fire it).
+    _completion_callback_registered: bool = field(default=False, init=False)
 
     @property
     def address(self) -> str:
@@ -423,6 +453,7 @@ class ReplicaSelection:
             "port": self.port,
             "node_id": self.node_id,
             "availability_zone": self.availability_zone,
+            "replica_metadata": self.replica_metadata,
         }
 
     def _mark_dispatched(self) -> None:
@@ -442,9 +473,12 @@ class ReplicaSelection:
         """Internal: Release the reserved slot.
 
         Returns the replica's reported num_ongoing_requests after the release,
-        or None if dispatch already consumed the slot (and ``force`` is False).
+        or None if dispatch already consumed the slot (and ``force`` is False),
+        or None if this selection was created without a reservation.
         """
+        if self._slot_token is None:
+            return  # type: ignore[return-value]
         if self._dispatched and not force:
-            return None
+            return  # type: ignore[return-value]
 
         return await self._replica.release_slot(self._slot_token)

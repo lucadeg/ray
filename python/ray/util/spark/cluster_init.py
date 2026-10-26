@@ -44,7 +44,7 @@ from ray._common.network_utils import (
     parse_address,
 )
 from ray._common.utils import load_class
-from ray.autoscaler._private.spark.node_provider import HEAD_NODE_ID
+from ray.autoscaler._private.spark.node_provider import HEAD_NODE_ID, HEAD_NODE_TYPE
 from ray.util.annotations import DeveloperAPI, PublicAPI
 
 _logger = logging.getLogger("ray.util.spark")
@@ -57,6 +57,14 @@ MAX_NUM_WORKER_NODES = -1
 
 RAY_ON_SPARK_COLLECT_LOG_TO_PATH = "RAY_ON_SPARK_COLLECT_LOG_TO_PATH"
 RAY_ON_SPARK_START_RAY_PARENT_PID = "RAY_ON_SPARK_START_RAY_PARENT_PID"
+RAY_ENABLE_AUTOSCALER_V2 = "RAY_enable_autoscaler_v2"
+
+
+def _is_autoscaler_v2_enabled(ray_node_custom_env):
+    return ray_node_custom_env.get(RAY_ENABLE_AUTOSCALER_V2, "").lower() in (
+        "true",
+        "1",
+    )
 
 
 def _check_system_environment():
@@ -629,7 +637,10 @@ def _setup_ray_cluster(
         _start_spark_job_server,
     )
 
-    ray_node_custom_env = start_hook.custom_environment_variables()
+    ray_node_custom_env = {
+        **start_hook.custom_environment_variables(),
+        RAY_ENABLE_AUTOSCALER_V2: os.environ.get(RAY_ENABLE_AUTOSCALER_V2, "0"),
+    }
     spark_job_server = _start_spark_job_server(
         ray_head_ip, spark_job_server_port, spark, ray_node_custom_env
     )
@@ -1252,6 +1263,9 @@ def setup_ray_cluster(
     `ray.util.spark.shutdown_ray_cluster()`.
     Note: If the active ray cluster haven't shut down, you cannot create a new ray
     cluster.
+    Ray on Spark uses Autoscaler V1 by default. Set the environment variable
+    ``RAY_enable_autoscaler_v2=1`` before calling this function to enable
+    Autoscaler V2.
 
     Args:
         max_worker_nodes: This argument represents maximum ray worker nodes to start
@@ -1351,6 +1365,9 @@ def setup_ray_cluster(
             or referenced objects (either in-memory or spilled to disk). This parameter
             does not affect the head node.
             Default value is 1.0, minimum value is 0
+        **kwargs: Additional keyword arguments forwarded to
+            ``_setup_ray_cluster_internal`` for advanced/experimental options.
+
     Returns:
         returns a tuple of (address, remote_connection_address)
         "address" is in format of "<ray_head_node_ip>:<port>"
@@ -1489,6 +1506,7 @@ def _start_ray_worker_nodes(
     worker_node_options,
     collect_log_to_path,
     node_id,
+    node_type,
 ):
     # NB:
     # In order to start ray worker nodes on spark cluster worker machines,
@@ -1551,6 +1569,13 @@ def _start_ray_worker_nodes(
             "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER": "1",
             **ray_node_custom_env,
         }
+        if _is_autoscaler_v2_enabled(ray_node_custom_env):
+            ray_worker_node_extra_envs.update(
+                {
+                    "RAY_CLOUD_INSTANCE_ID": str(node_id),
+                    "RAY_NODE_TYPE_NAME": node_type,
+                }
+            )
 
         if num_gpus_per_node > 0:
             task_resources = context.resources()
@@ -1615,6 +1640,7 @@ def _start_ray_worker_nodes(
                 ),
                 json={
                     "spark_job_group_id": spark_job_group_id,
+                    "node_id": node_id,
                 },
             )
 
@@ -1732,6 +1758,12 @@ class AutoscalingCluster:
         Args:
             head_resources: resources of the head node, including CPU.
             worker_node_types: autoscaler node types config for worker nodes.
+            extra_provider_config: extra fields merged into the autoscaler
+                ``provider`` config.
+            upscaling_speed: maximum allowed in-flight upscaling as a
+                multiple of the current cluster size.
+            idle_timeout_minutes: minutes an idle worker node must remain
+                idle before the autoscaler removes it.
         """
         self._head_resources = head_resources.copy()
         self._head_resources["NODE_ID_AS_RESOURCE"] = HEAD_NODE_ID
@@ -1862,6 +1894,13 @@ class AutoscalingCluster:
             RAY_ON_SPARK_START_RAY_PARENT_PID: str(os.getpid()),
             **ray_node_custom_env,
         }
+        if _is_autoscaler_v2_enabled(ray_node_custom_env):
+            extra_env.update(
+                {
+                    "RAY_CLOUD_INSTANCE_ID": str(HEAD_NODE_ID),
+                    "RAY_NODE_TYPE_NAME": HEAD_NODE_TYPE,
+                }
+            )
 
         self.ray_head_node_cmd = ray_head_node_cmd
 

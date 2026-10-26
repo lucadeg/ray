@@ -2,7 +2,19 @@ import time
 import uuid
 from typing import Dict, List, Optional, Set
 
+from ray._private.ray_constants import env_integer
 from ray.core.generated.instance_manager_pb2 import Instance, InstanceUpdateEvent
+
+# Upper bound on retained status-history entries per instance. The history is
+# append-only and read only for the most recent transitions (e.g. latest
+# details, per-status timestamps), so trimming the oldest entries bounds the
+# memory a single long-lived or repeatedly-stuck instance can hold while
+# preserving every read done by the reconciler. Floored at 10 so a
+# misconfigured env var cannot trim the history to empty, which would trip the
+# `len(status_times_ns) >= 1` assertion in `has_timeout`.
+MAX_STATUS_HISTORY_LENGTH = max(
+    10, env_integer("RAY_AUTOSCALER_INSTANCE_MAX_STATUS_HISTORY_LENGTH", 200)
+)
 
 
 class InstanceUtil:
@@ -33,6 +45,9 @@ class InstanceUtil:
             instance_type: The instance type.
             status: The status of the new instance.
             details: The details of the status transition.
+
+        Returns:
+            The newly-created instance.
         """
         instance = Instance()
         instance.version = 0  # it will be populated by the underlying storage.
@@ -152,6 +167,7 @@ class InstanceUtil:
         Args:
             instance: The instance to update.
             status: The new status to transition to.
+            details: The details of the status transition.
         """
         now_ns = time.time_ns()
         instance.status_history.append(
@@ -161,16 +177,23 @@ class InstanceUtil:
                 details=details,
             )
         )
+        # Bound the append-only history so an instance that is repeatedly stuck
+        # or retried before reaching a terminal state cannot grow unboundedly.
+        # Only the most recent transitions are ever read, so drop the oldest.
+        # Delete one at a time (not a slice) since slice deletion on a protobuf
+        # repeated field is not supported across all protobuf versions.
+        while len(instance.status_history) > MAX_STATUS_HISTORY_LENGTH:
+            del instance.status_history[0]
 
     @staticmethod
     def has_timeout(instance: Instance, timeout_s: int) -> bool:
         """
         Returns True if the instance has been in the current status for more
-        than the timeout_seconds.
+        than the given timeout.
 
         Args:
             instance: The instance to check.
-            timeout_seconds: The timeout in seconds.
+            timeout_s: The timeout in seconds.
 
         Returns:
             True if the instance has been in the current status for more than
@@ -380,6 +403,10 @@ class InstanceUtil:
             select_instance_status: The go-to status to search for, i.e. select
                 only status history when the instance transitions into the status.
                 If None, returns all status updates.
+
+        Returns:
+            The list of status updates matching ``select_instance_status``,
+            or all status updates when ``select_instance_status`` is None.
         """
         history = []
         for status_update in instance.status_history:
@@ -401,8 +428,11 @@ class InstanceUtil:
 
         Args:
             instance: The instance.
-            instance_status: The status to search for. If None, returns the last
-                status update.
+            select_instance_status: The status to search for. If None, returns
+                the last status update.
+
+        Returns:
+            The last matching status update, or None if no status updates match.
         """
         history = InstanceUtil.get_status_transitions(instance, select_instance_status)
         history.sort(key=lambda x: x.timestamp_ns)
@@ -420,8 +450,8 @@ class InstanceUtil:
 
         Args:
             instance: The instance.
-            instance_status: The status to search for. If None, returns all
-                status updates timestamps.
+            select_instance_status: The status to search for. If None, returns
+                all status update timestamps.
 
         Returns:
             The list of timestamps of the instance status updates.

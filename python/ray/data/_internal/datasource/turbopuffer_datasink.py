@@ -14,8 +14,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from ray._common.retry import call_with_retry
-from ray.data._internal.arrow_block import ArrowBlockAccessor
-from ray.data._internal.arrow_ops import transform_pyarrow
 from ray.data._internal.execution.interfaces import TaskContext
 from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 from ray.data._internal.util import _check_import
@@ -86,50 +84,39 @@ class TurbopufferDatasink(Datasink):
     Examples:
         Write to a single namespace using a region:
 
-        .. testcode::
-           :skipif: True
-
-           import ray
-           from ray.data._internal.datasource.turbopuffer_datasink import (
-               TurbopufferDatasink,
-           )
-
-           ds = ray.data.range(100)
-           ds = ds.map_batches(lambda batch: {"id": batch["id"], "vector": ...})
-
-           ds.write_datasink(
-               TurbopufferDatasink(
-                   namespace="my-namespace",
-                   api_key="<YOUR_API_KEY>",
-                   region="gcp-us-central1",
-               )
-           )
+        >>> import ray  # doctest: +SKIP_EXAMPLE
+        >>> from ray.data._internal.datasource.turbopuffer_datasink import (
+        ...     TurbopufferDatasink,
+        ... )
+        >>> ds = ray.data.range(100)
+        >>> ds = ds.map_batches(lambda batch: {"id": batch["id"], "vector": ...})
+        >>> ds.write_datasink(
+        ...     TurbopufferDatasink(
+        ...         namespace="my-namespace",
+        ...         api_key="<YOUR_API_KEY>",
+        ...         region="gcp-us-central1",
+        ...     )
+        ... )
 
         Write using a base URL instead of a region:
 
-        .. testcode::
-           :skipif: True
-
-           ds.write_datasink(
-               TurbopufferDatasink(
-                   namespace="my-namespace",
-                   api_key="<YOUR_API_KEY>",
-                   base_url="https://gcp-us-central1.turbopuffer.com",
-               )
-           )
+        >>> ds.write_datasink(
+        ...     TurbopufferDatasink(
+        ...         namespace="my-namespace",
+        ...         api_key="<YOUR_API_KEY>",
+        ...         base_url="https://gcp-us-central1.turbopuffer.com",
+        ...     )
+        ... )
 
         Write to multiple namespaces driven by a column:
 
-        .. testcode::
-           :skipif: True
-
-           ds.write_datasink(
-               TurbopufferDatasink(
-                   namespace_column="tenant",
-                   api_key="<YOUR_API_KEY>",
-                   region="gcp-us-central1",
-               )
-           )
+        >>> ds.write_datasink(
+        ...     TurbopufferDatasink(
+        ...         namespace_column="tenant",
+        ...         api_key="<YOUR_API_KEY>",
+        ...         region="gcp-us-central1",
+        ...     )
+        ... )
     """
 
     def __init__(
@@ -358,8 +345,9 @@ class TurbopufferDatasink(Datasink):
         # Sort by the namespace column so _iter_groups_sorted can yield
         # contiguous zero-copy slices for each unique namespace value.
         sort_key = SortKey(key=group_col_name, descending=False)
-        sorted_table = transform_pyarrow.sort(table, sort_key)
-        block_accessor = ArrowBlockAccessor.for_block(sorted_table)
+        block_accessor = BlockAccessor.for_block(
+            BlockAccessor.for_block(table).sort(sort_key)
+        )
 
         for (namespace_name,), group_table in block_accessor._iter_groups_sorted(
             sort_key
